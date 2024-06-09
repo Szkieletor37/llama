@@ -5,14 +5,21 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-import fairscale.nn.model_parallel.initialize as fs_init
+#import fairscale.nn.model_parallel.initialize as fs_init
+
 import torch
 import torch.nn.functional as F
+
+import bitsandbytes as bnb
+
+"""
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
 )
+"""
+
 from torch import nn
 
 
@@ -198,40 +205,46 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = fs_init.get_model_parallel_world_size()
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        #model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads #// model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads #// model_parallel_size
+
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
+        self.wq = bnb.nn.Linear8bitLt(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
+            #gather_output=False,
+            #init_method=lambda x: x,
         )
-        self.wk = ColumnParallelLinear(
+        self.wk = bnb.nn.Linear8bitLt(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
+            #gather_output=False,
+            #init_method=lambda x: x,
         )
-        self.wv = ColumnParallelLinear(
+        self.wv = bnb.nn.Linear8bitLt(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
+            #gather_output=False,
+            #init_method=lambda x: x,
         )
-        self.wo = RowParallelLinear(
+        self.wo = bnb.nn.Linear8bitLt(
             args.n_heads * self.head_dim,
             args.dim,
             bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
+            #input_is_parallel=True,
+            #init_method=lambda x: x,
         )
+        print("wq: ", self.wq)
+        print("wk: ", self.wk)
+        print("wv: ", self.wv)
+        print("wo: ", self.wo)
+
 
         self.cache_k = torch.zeros(
             (
@@ -334,15 +347,18 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
+        self.w1 = bnb.nn.Linear8bitLt(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
-        self.w2 = RowParallelLinear(
+        self.w2 = bnb.nn.Linear8bitLt(
             hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
-        self.w3 = ColumnParallelLinear(
+        self.w3 = bnb.nn.Linear8bitLt(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
+        print("w1: ", self.w1)
+        print("w2: ", self.w2)
+        print("w3: ", self.w3)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -434,8 +450,8 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = ParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
+        self.tok_embeddings = torch.nn.Embedding(
+            params.vocab_size, params.dim
         )
 
         self.layers = torch.nn.ModuleList()
@@ -443,8 +459,8 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        self.output = bnb.nn.Linear8bitLt(
+            params.dim, params.vocab_size, bias=False
         )
 
         self.freqs_cis = precompute_freqs_cis(
