@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 import bitsandbytes as bnb
+import tqdm
 
 """
 from fairscale.nn.model_parallel.layers import (
@@ -348,13 +349,13 @@ class FeedForward(nn.Module):
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.w1 = bnb.nn.Linear8bitLt(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, hidden_dim, bias=False
         )
         self.w2 = bnb.nn.Linear8bitLt(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+            hidden_dim, dim, bias=False
         )
         self.w3 = bnb.nn.Linear8bitLt(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, hidden_dim, bias=False
         )
         print("w1: ", self.w1)
         print("w2: ", self.w2)
@@ -425,6 +426,20 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
+def convert_linear_to_bnb(float_linear):
+    new_layer = bnb.nn.Linear8bitLt(
+        float_linear.in_features,
+        float_linear.out_features,
+        bias=float_linear.bias is not None,
+    )
+    new_layer._parameters["weight"] = bnb.nn.Int8Params(
+        float_linear.weight.data.cpu(),
+        requires_grad=False,
+        has_fp16_weights=False,
+    )
+    if float_linear.bias is not None:
+        new_layer._parameters["bias"] = float_linear.bias
+    return new_layer
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
@@ -509,3 +524,30 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
+    
+    def quantize(self):
+        # https://github.com/pytorch/vision/issues/2391#issuecomment-653900218
+        def get_layer(model, name):
+            layer = model
+            for attr in name.split("."):
+                layer = getattr(layer, attr)
+            return layer
+
+        def set_layer(model, name, layer):
+            try:
+                attrs, name = name.rsplit(".", 1)
+                model = get_layer(model, attrs)
+            except ValueError:
+                pass
+            setattr(model, name, layer)
+
+        linear_layers = {
+            k: v for k, v in self.named_modules() if isinstance(v, nn.Linear)
+        }
+
+        print("Quantizing", len(linear_layers), "layers")
+        for name, layer in tqdm.tqdm(linear_layers.items()):
+            new_layer = convert_linear_to_bnb(layer)
+            set_layer(self, name, new_layer)
+        self.cuda()
+
